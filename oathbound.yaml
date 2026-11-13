@@ -63,20 +63,6 @@ microphone:
     bits_per_sample: 32bit
     pdm: false
 
-    on_data:
-      - lambda: |-
-          oathbound_recording::append(x);
-
-          static uint32_t callback_count = 0;
-          callback_count++;
-
-          if (callback_count % 10 == 0) {
-            ESP_LOGI(
-              "MIC_CAPTURE",
-              "Received Audio buffer: %u bytes",
-              (unsigned) x.size()  
-            );
-          }
 script:
   - id: record_command
     mode: single
@@ -161,3 +147,9 @@ micro_wake_word:
 
     - script.execute: record_command
 
+external_components:
+  - source:
+      type: local
+      path: components
+
+oathbound_audio:
