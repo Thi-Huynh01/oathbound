@@ -2,36 +2,32 @@ esphome:
   name: oathbound
   includes:
     - test_components.h
+
   on_boot:
     priority: -100
     then:
-      - light.turn_on:
-          id: lantern_leds
-          red: 0%
-          green: 100%
-          blue: 0%
-          brightness: 50%
       - delay: 2s
-      - lambda: |-
-          xTaskCreate(
-            record_and_play_audio_task,
-            "audio_task",
-            12288,
-            nullptr,
-            2,
-            nullptr
-          );
-
+      - micro_wake_word.start:
+    
 esp32:
   board: esp32-s3-devkitc-1
   framework:
     type: esp-idf
 
+psram:
+  mode: octal
+  speed: 80MHz
+
 logger:
+  level: DEBUG
 
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
+  on_connect:
+      then:
+        - lambda: |-
+            oathbound_recording::start_http_server();
   ap:
     ssid: "Oathbound Fallback"
     password: "lantern1234"
@@ -47,11 +43,121 @@ light:
     chipset: WS2812
     rgb_order: GRB
     effects:
-      - addressable_rainbow:
-      - addressable_color_wipe:
-      - addressable_scan:
+      - pulse:
+          name: "Green Lantern Pulse"
+          transition_length: 1s
 
 i2s_audio:
+  id: i2s_in
+  i2s_lrclk_pin: GPIO5
+  i2s_bclk_pin: GPIO4
 
-speaker:
+microphone:
+  - platform: i2s_audio
+    id: inmp441_mic
+    i2s_audio_id: i2s_in
+    adc_type: external
+    i2s_din_pin: GPIO6
+    channel: left
+    sample_rate: 16000
+    bits_per_sample: 32bit
+    pdm: false
+
+    on_data:
+      - lambda: |-
+          oathbound_recording::append(x);
+
+          static uint32_t callback_count = 0;
+          callback_count++;
+
+          if (callback_count % 10 == 0) {
+            ESP_LOGI(
+              "MIC_CAPTURE",
+              "Received Audio buffer: %u bytes",
+              (unsigned) x.size()  
+            );
+          }
+script:
+  - id: record_command
+    mode: single
+    then:
+      - micro_wake_word.stop:
+
+      - if:
+          condition:
+            lambda: 'return oathbound_recording::begin();'
+          then:
+              
+            - logger.log: "Starting 10-second recording"
+            - light.turn_on:
+                id: lantern_leds
+                red: 0%
+                green: 100%
+                blue: 0%
+                brightness: 100%
+            - microphone.capture:
+
+            - delay: 10s
+
+            - microphone.stop_capture:
+
+            - lambda: |-
+                size_t captured = oathbound_recording::finish();
+
+                ESP_LOGI(
+                  "OATHBOUND_RECORDING",
+                  "Recording finished: %u raw bytes captured",
+                  (unsigned) captured
+                );
+
+                size_t pcm_bytes =
+                    oathbound_recording::convert_to_pcm16(captured);
+                
+                ESP_LOGI(
+                  "OATHBOUND_RECORDING",
+                  "16-bit PCM audio ready: %u bytes",
+                  (unsigned) pcm_bytes
+                );
+
+                size_t wav_bytes = 
+                  oathbound_recording::package_wav(pcm_bytes);
+                
+                oathbound_recording::wav_size = wav_bytes;
+
+                ESP_LOGI(
+                  "OATHBOUND_RECORDING",
+                  "WAV audio ready: %u bytes",
+                  (unsigned) wav_bytes
+                );
+            - light.turn_off:
+                id: lantern_leds
+          else:
+            - logger.log: "Recording failed: unable to allocate PSRAM buffer"
+      
+      - micro_wake_word.start:
+  - id: play_test_audio
+    mode: single
+    then:
+    - micro_wake_word.stop:
+    - delay: 500ms
+    - micro_wake_word.start:
+
+
+micro_wake_word:
+  microphone:
+    microphone: inmp441_mic
+    channels: 0
+    gain_factor: 4
+  
+  stop_after_detection: false
+
+  models:
+    - model: okay_nabu
+  
+  on_wake_word_detected:
+    - logger.log:
+        format: "Wake word detected: %s"
+        args: ['wake_word.c_str()']
+
+    - script.execute: record_command
 

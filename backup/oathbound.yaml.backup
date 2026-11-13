@@ -1,0 +1,57 @@
+esphome:
+  name: oathbound
+  includes:
+    - test_components.h
+  on_boot:
+    priority: -100
+    then:
+      - light.turn_on:
+          id: lantern_leds
+          red: 0%
+          green: 100%
+          blue: 0%
+          brightness: 50%
+      - delay: 2s
+      - lambda: |-
+          xTaskCreate(
+            record_and_play_audio_task,
+            "audio_task",
+            12288,
+            nullptr,
+            2,
+            nullptr
+          );
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: esp-idf
+
+logger:
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "Oathbound Fallback"
+    password: "lantern1234"
+
+captive_portal:
+
+light:
+  - platform: esp32_rmt_led_strip
+    id: lantern_leds
+    name: "Oathbound Lantern"
+    pin: GPIO10
+    num_leds: 20
+    chipset: WS2812
+    rgb_order: GRB
+    effects:
+      - addressable_rainbow:
+      - addressable_color_wipe:
+      - addressable_scan:
+
+i2s_audio:
+
+speaker:
+
