@@ -1,5 +1,6 @@
 package com.oathbound.backend.controller;
 
+import com.oathbound.backend.service.SonioxService;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -18,10 +19,14 @@ import java.time.Duration;
 public class AudioController {
 
     private final S3Presigner s3Presigner;
+    private final SonioxService sonioxService;
+
     private static final String BUCKET_NAME = "oathbound-audio-assets";
 
-    public AudioController(S3Presigner s3Presigner) {
+    public AudioController(S3Presigner s3Presigner, SonioxService sonioxService) {
+
         this.s3Presigner = s3Presigner;
+        this.sonioxService = sonioxService;
     }
 
     @GetMapping("/api/audio/recording-url")
@@ -44,12 +49,15 @@ public class AudioController {
     }
 
     @PostMapping(value="/api/audio/upload", consumes= MediaType.MULTIPART_FORM_DATA_VALUE)
-    public ResponseEntity<String> uploadRecording(@RequestParam("file") MultipartFile file) {
+    public ResponseEntity<String> uploadRecording(@RequestParam("file") MultipartFile file) throws Exception {
+
         if (file.isEmpty()) {
             return ResponseEntity.badRequest().body("No recording received");
         }
-        System.out.println("Received Recording: " + file.getOriginalFilename());
+        System.out.println("Received recording: " + file.getOriginalFilename());
+        String transcript = sonioxService.uploadAndTranscribe(file);
+        System.out.println("Soniox upload response: " + transcript);
+        return ResponseEntity.ok(transcript);
 
-        return ResponseEntity.ok("Recording received successfully");
     }
 }
