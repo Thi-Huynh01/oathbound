@@ -1,7 +1,12 @@
 package com.oathbound.backend.controller;
 
+import org.springframework.http.MediaType;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.multipart.MultipartFile;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
 import software.amazon.awssdk.services.s3.presigner.S3Presigner;
 import software.amazon.awssdk.services.s3.presigner.model.GetObjectPresignRequest;
@@ -24,7 +29,7 @@ public class AudioController {
 
         GetObjectRequest getObjectRequest = GetObjectRequest.builder()
                 .bucket(BUCKET_NAME)
-                .key("audio/recording.wav")
+                .key("recording.mp3")
                 .build();
 
         GetObjectPresignRequest presignRequest = GetObjectPresignRequest.builder()
@@ -36,5 +41,15 @@ public class AudioController {
                 s3Presigner.presignGetObject(presignRequest);
 
         return presignedRequest.url().toString();
+    }
+
+    @PostMapping(value="/api/audio/upload", consumes= MediaType.MULTIPART_FORM_DATA_VALUE)
+    public ResponseEntity<String> uploadRecording(@RequestParam("file") MultipartFile file) {
+        if (file.isEmpty()) {
+            return ResponseEntity.badRequest().body("No recording received");
+        }
+        System.out.println("Received Recording: " + file.getOriginalFilename());
+
+        return ResponseEntity.ok("Recording received successfully");
     }
 }

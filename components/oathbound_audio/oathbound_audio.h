@@ -5,8 +5,9 @@
 #include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
 #include "driver/i2s_std.h"
-#include <cstring>
+#include "micro_mp3/mp3_decoder.h"
 
+#include <cstring>
 #include <string>
 
 namespace oathbound_audio {
@@ -37,7 +38,7 @@ namespace oathbound_audio {
         static constexpr const char *TAG = "oathbound_audio";
         i2s_chan_handle_t speaker_tx = nullptr;
 
-        bool initialize_speaker() {
+        bool initialize_speaker(uint32_t sample_rate = 16000) {
             ESP_LOGI(TAG, "Initializing MAX98357A speaker...");
 
             i2s_chan_config_t channel_config =
@@ -59,7 +60,7 @@ namespace oathbound_audio {
             }
 
             i2s_std_config_t standard_config = {
-            .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(16000),
+            .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate),
             .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(
                 I2S_DATA_BIT_WIDTH_16BIT,
                 I2S_SLOT_MODE_MONO
@@ -276,6 +277,195 @@ namespace oathbound_audio {
 
             return true;
         }
+        bool play_mp3(const uint8_t *mp3, size_t length) {
+            ESP_LOGI(TAG, "Starting MP3 playback...");
+
+            micro_mp3::Mp3Decoder decoder;
+
+            // Allocate PCM output buffer in internal RAM.
+            int16_t *pcm_buffer = static_cast<int16_t *>(
+                heap_caps_malloc(
+                    micro_mp3::MP3_MIN_OUTPUT_BUFFER_BYTES,
+                    MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT
+                )
+            );
+
+            if (pcm_buffer == nullptr) {
+                ESP_LOGE(TAG, "Failed to allocate MP3 PCM buffer");
+                return false;
+            }
+
+            size_t input_offset = 0;
+            bool speaker_initialized = false;
+            bool playback_success = true;
+
+            while (input_offset < length) {
+                size_t bytes_consumed = 0;
+                size_t samples_decoded = 0;
+
+                micro_mp3::Mp3Result result = decoder.decode(
+                    mp3 + input_offset,
+                    length - input_offset,
+                    reinterpret_cast<uint8_t *>(pcm_buffer),
+                    micro_mp3::MP3_MIN_OUTPUT_BUFFER_BYTES,
+                    bytes_consumed,
+                    samples_decoded
+                );
+
+                input_offset += bytes_consumed;
+
+                if (result == micro_mp3::MP3_STREAM_INFO_READY ||
+                    result == micro_mp3::MP3_STREAM_INFO_CHANGED) {
+
+                    uint32_t sample_rate = decoder.get_sample_rate();
+                    uint8_t channels = decoder.get_channels();
+
+                    ESP_LOGI(
+                        TAG,
+                        "MP3 format: %lu Hz, %u channel(s)",
+                        (unsigned long) sample_rate,
+                        channels
+                    );
+
+                    if (sample_rate == 0 || channels == 0 || channels > 2) {
+                        ESP_LOGE(TAG, "Invalid MP3 stream information");
+                        playback_success = false;
+                        break;
+                    }
+
+                    if (speaker_tx != nullptr) {
+                        i2s_channel_disable(speaker_tx);
+                        i2s_del_channel(speaker_tx);
+                        speaker_tx = nullptr;
+                    }
+
+                    if (!initialize_speaker(sample_rate)) {
+                        playback_success = false;
+                        break;
+                    }
+
+                    speaker_initialized = true;
+                    continue;
+                }
+
+                if (result == micro_mp3::MP3_NEED_MORE_DATA) {
+                    if (bytes_consumed == 0) {
+                        break;
+                    }
+
+                    continue;
+                }
+
+                if (result == micro_mp3::MP3_DECODE_ERROR) {
+                    ESP_LOGW(TAG, "Skipping corrupted MP3 frame");
+                    continue;
+                }
+
+                if (result == micro_mp3::MP3_OUTPUT_BUFFER_TOO_SMALL) {
+                    ESP_LOGE(TAG, "MP3 output buffer too small");
+                    playback_success = false;
+                    break;
+                }
+
+                if (result < 0) {
+                    ESP_LOGE(TAG, "MP3 decoding failed: %d", result);
+                    playback_success = false;
+                    break;
+                }
+
+                if (samples_decoded == 0) {
+                    if (bytes_consumed == 0) {
+                        break;
+                    }
+
+                    continue;
+                }
+
+                if (!speaker_initialized) {
+                    ESP_LOGE(TAG, "Received PCM before speaker initialization");
+                    playback_success = false;
+                    break;
+                }
+
+                uint8_t channels = decoder.get_channels();
+
+                // Convert stereo PCM to mono when necessary.
+                if (channels == 2) {
+                    for (size_t i = 0; i < samples_decoded; i++) {
+                        int32_t left = pcm_buffer[i * 2];
+                        int32_t right = pcm_buffer[i * 2 + 1];
+
+                        pcm_buffer[i] = static_cast<int16_t>(
+                            (left + right) / 2
+                        );
+                    }
+                }
+
+                // Reduce volume to 25%
+                for (size_t i = 0; i < samples_decoded; i++) {
+                    pcm_buffer[i] = static_cast<int16_t>(
+                        pcm_buffer[i] * 0.25f
+                    );
+                }
+
+                size_t pcm_bytes = samples_decoded * sizeof(int16_t);
+                size_t bytes_written = 0;
+
+                esp_err_t write_result = i2s_channel_write(
+                    speaker_tx,
+                    pcm_buffer,
+                    pcm_bytes,
+                    &bytes_written,
+                    portMAX_DELAY
+                );
+
+                if (write_result != ESP_OK) {
+                    ESP_LOGE(
+                        TAG,
+                        "MP3 I2S playback failed: %s",
+                        esp_err_to_name(write_result)
+                    );
+
+                    playback_success = false;
+                    break;
+                }
+            }
+
+            if (speaker_tx != nullptr) {
+                ESP_LOGI(TAG, "Flushing MP3 speaker output...");
+
+                int16_t silence[256] = {};
+
+                for (int i = 0; i < 16; i++) {
+                    size_t bytes_written = 0;
+
+                    if (i2s_channel_write(
+                        speaker_tx,
+                        silence,
+                        sizeof(silence),
+                        &bytes_written,
+                        portMAX_DELAY
+                    ) != ESP_OK) {
+                        playback_success = false;
+                        break;
+                    }
+                }
+
+                i2s_channel_disable(speaker_tx);
+                i2s_del_channel(speaker_tx);
+                speaker_tx = nullptr;
+            }
+
+            heap_caps_free(pcm_buffer);
+
+            if (!playback_success) {
+                ESP_LOGE(TAG, "MP3 playback failed");
+                return false;
+            }
+
+            ESP_LOGI(TAG, "MP3 playback completed");
+            return true;
+        }
 
         static void download_task(void *parameter) {
             auto *self = static_cast<OathboundAudio *>(parameter);
@@ -291,7 +481,7 @@ namespace oathbound_audio {
 
             esp_http_client_config_t backend_config = {};
             backend_config.url =
-                "http://192.168.1.10:8080/api/audio/recording-url";
+                "http://192.168.1.20:8080/api/audio/recording-url";
             backend_config.event_handler = http_event_handler;
             backend_config.user_data = &url_context;
             backend_config.timeout_ms = 15000;
@@ -401,7 +591,16 @@ namespace oathbound_audio {
                     ESP_LOGI(TAG, "Audio playback completed");
                     }
             } else {
-                ESP_LOGE(TAG, "Downloaded data is not a valid WAV file");
+                ESP_LOGI(TAG, "Non-WAV audio detected. Attempting MP3 playback...");
+
+                if (!play_mp3(
+                    audio_context.buffer,
+                    audio_context.bytes_received
+                )) {
+                    ESP_LOGE(TAG, "MP3 playback failed");
+                } else {
+                    ESP_LOGI(TAG, "MP3 playback completed");
+                }
             }
 
             heap_caps_free(audio_context.buffer);

@@ -1,18 +1,25 @@
 esphome:
   name: oathbound
   includes:
-    - test_components.h
+    - oathbound_recording.h
 
   on_boot:
     priority: -100
     then:
       - delay: 2s
+      - lambda: |-
+          id(inmp441_mic).add_data_callback([](const auto &data) {
+              oathbound_recording::append(data);
+            }
+          );
       - micro_wake_word.start:
     
 esp32:
   board: esp32-s3-devkitc-1
   framework:
     type: esp-idf
+    components:
+      - esphome/micro-mp3^0.4.0
 
 psram:
   mode: octal
@@ -98,16 +105,16 @@ script:
 
                 size_t pcm_bytes =
                     oathbound_recording::convert_to_pcm16(captured);
-                
+
                 ESP_LOGI(
                   "OATHBOUND_RECORDING",
                   "16-bit PCM audio ready: %u bytes",
                   (unsigned) pcm_bytes
                 );
 
-                size_t wav_bytes = 
-                  oathbound_recording::package_wav(pcm_bytes);
-                
+                size_t wav_bytes =
+                    oathbound_recording::package_wav(pcm_bytes);
+
                 oathbound_recording::wav_size = wav_bytes;
 
                 ESP_LOGI(
@@ -115,6 +122,14 @@ script:
                   "WAV audio ready: %u bytes",
                   (unsigned) wav_bytes
                 );
+
+                if (wav_bytes > 0) {
+                  bool started = oathbound_recording::start_upload_task();
+
+                  if (!started) {
+                      ESP_LOGE("OATHBOUND_RECORDING", "Could not start upload task");
+                  }
+                }
             - light.turn_off:
                 id: lantern_leds
           else:

@@ -7,12 +7,16 @@
 #include <vector>
 #include <atomic>
 #include <cstring>
+#include <string>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 #include "driver/i2s_std.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "esp_http_server.h"
+#include "esp_http_client.h"
 
 namespace oathbound_recording {
 
@@ -24,9 +28,15 @@ namespace oathbound_recording {
     inline uint8_t* buffer = nullptr;
     inline std::atomic<size_t> bytes_written{0};
     inline std::atomic<bool> recording_active{false};
+    inline std::atomic<bool> upload_in_progress{false};
 
     // allocate the recording buffer in PSRAM and prepare for recording
     inline bool begin() {
+
+        if (upload_in_progress.load()) {
+            ESP_LOGW("OATHBOUND_RECORDING", "Previous upload still in progress");
+            return false;
+        }
         recording_active.store(false);
 
         if (buffer == nullptr) {
@@ -260,5 +270,192 @@ namespace oathbound_recording {
             "OATHBOUND_HTTP",
             "WAV download endpoint started"
         );
+    }
+
+    inline bool write_all(esp_http_client_handle_t client, const char* data, int length) {
+        int offset = 0;
+
+        while (offset < length) {
+            int chunk_size = std::min(1024, length - offset);
+
+            int written = esp_http_client_write(
+                client,
+                data + offset,
+                chunk_size
+            );
+
+            if (written <= 0) {
+                ESP_LOGE("OATHBOUND_RECORDING", "HTTP write failed");
+                return false;
+            }
+
+            offset += written;
+
+            // Give other FreeRTOS tasks time to run.
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+
+        return true;
+    }
+
+    inline bool upload_recording() {
+        if (buffer == nullptr || wav_size == 0) {
+            ESP_LOGE("OATHBOUND_RECORDING", "No WAV recording available");
+            return false;
+        }
+
+        static constexpr const char* URL =
+            "http://192.168.1.20:8080/api/audio/upload";
+
+        static constexpr const char* BOUNDARY =
+            "OATHBOUND_BOUNDARY";
+
+        esp_http_client_config_t config = {};
+        config.url = URL;
+        config.method = HTTP_METHOD_POST;
+        config.timeout_ms = 30000;
+
+        esp_http_client_handle_t client =
+            esp_http_client_init(&config);
+
+        if (client == nullptr) {
+            ESP_LOGE("OATHBOUND_RECORDING", "HTTP client initialization failed");
+            return false;
+        }
+
+        std::string header =
+            "--" + std::string(BOUNDARY) + "\r\n"
+            "Content-Disposition: form-data; name=\"file\"; filename=\"recording.wav\"\r\n"
+            "Content-Type: audio/wav\r\n\r\n";
+
+        std::string footer =
+            "\r\n--" + std::string(BOUNDARY) + "--\r\n";
+
+        size_t content_length =
+            header.size() + wav_size + footer.size();
+
+        std::string content_type =
+            "multipart/form-data; boundary=" + std::string(BOUNDARY);
+
+        esp_http_client_set_header(
+            client,
+            "Content-Type",
+            content_type.c_str()
+        );
+
+        esp_err_t err =
+            esp_http_client_open(client, content_length);
+
+        if (err != ESP_OK) {
+            ESP_LOGE(
+                "OATHBOUND_RECORDING",
+                "HTTP connection failed: %s",
+                esp_err_to_name(err)
+            );
+
+            esp_http_client_cleanup(client);
+            return false;
+        }
+
+        bool success = true;
+
+        // Send multipart header.
+        success = write_all(
+            client,
+            header.data(),
+            header.size()
+        );
+
+        // Send WAV recording.
+        if (success) {
+            success = write_all(
+                client,
+                reinterpret_cast<const char*>(buffer),
+                wav_size
+            );
+        }
+
+        // Send multipart footer.
+        if (success) {
+            success = write_all(
+                client,
+                footer.data(),
+                footer.size()
+            );
+        }
+
+        if (!success) {
+            ESP_LOGE("OATHBOUND_RECORDING", "Failed to send recording");
+            esp_http_client_close(client);
+            esp_http_client_cleanup(client);
+            return false;
+        }
+
+        // Wait for Spring Boot's response.
+        esp_http_client_fetch_headers(client);
+
+        int status_code =
+            esp_http_client_get_status_code(client);
+
+        ESP_LOGI(
+            "OATHBOUND_RECORDING",
+            "Spring Boot HTTP status: %d",
+            status_code
+        );
+
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+
+        return status_code >= 200 && status_code < 300;
+    }
+
+    inline void upload_task(void* parameter) {
+        ESP_LOGI("OATHBOUND_RECORDING", "Background upload started");
+
+        bool uploaded = upload_recording();
+
+        if (uploaded) {
+            ESP_LOGI("OATHBOUND_RECORDING", "Recording uploaded successfully!");
+        } else {
+            ESP_LOGE("OATHBOUND_RECORDING", "Recording upload failed!");
+        }
+
+        upload_in_progress.store(false);
+
+        ESP_LOGI("OATHBOUND_RECORDING", "Background upload finished");
+
+        vTaskDelete(nullptr);
+    }
+
+    inline bool start_upload_task() {
+        if (buffer == nullptr || wav_size == 0) {
+            ESP_LOGE("OATHBOUND_RECORDING", "No WAV recording available");
+            return false;
+        }
+
+        bool expected = false;
+
+        if (!upload_in_progress.compare_exchange_strong(expected, true)) {
+            ESP_LOGW("OATHBOUND_RECORDING", "Upload already in progress");
+            return false;
+        }
+
+        BaseType_t result = xTaskCreate(
+            upload_task,
+            "oath_upload",
+            8192,
+            nullptr,
+            1,
+            nullptr
+        );
+
+        if (result != pdPASS) {
+            ESP_LOGE("OATHBOUND_RECORDING", "Failed to create upload task");
+            upload_in_progress.store(false);
+            return false;
+        }
+
+        ESP_LOGI("OATHBOUND_RECORDING", "Background upload task created");
+        return true;
     }
 }
