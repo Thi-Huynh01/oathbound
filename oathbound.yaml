@@ -12,6 +12,12 @@ esphome:
               oathbound_recording::append(data);
             }
           );
+
+          oathbound_recording::set_audio_playback_callback(
+            [](const std::string &url) {
+              id(oathbound_audio_player)->play_from_url(url);
+            }
+          );
       - micro_wake_word.start:
     
 esp32:
@@ -168,3 +174,4 @@ external_components:
       path: components
 
 oathbound_audio:
+  id: oathbound_audio_player

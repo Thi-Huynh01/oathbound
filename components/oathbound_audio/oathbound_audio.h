@@ -7,6 +7,7 @@
 #include "driver/i2s_std.h"
 #include "micro_mp3/mp3_decoder.h"
 
+#include <cctype>
 #include <cstring>
 #include <string>
 
@@ -14,25 +15,43 @@ namespace oathbound_audio {
 
     class OathboundAudio : public esphome::Component {
         public:
-        void setup() override {
-            ESP_LOGI(TAG, "Oathbound audio component initialized");
 
-            set_timeout(10000, [this]() {
-            ESP_LOGI(TAG, "Starting test audio download...");
-            download();
-            });
-        }
+            void setup() override {
+                ESP_LOGI(TAG, "Oathbound audio component initialized");
 
-        void download() {
-            xTaskCreate(
-                download_task,
-                "audio_download",
-                8192,
-                this,
-                5,
-                nullptr
-            );
-        }
+                set_timeout(10000, [this]() {
+                    ESP_LOGI(TAG, "Requesting startup audio URL...");
+
+                    xTaskCreate(
+                        startup_url_task,
+                        "startup_url",
+                        8192,
+                        this,
+                        5,
+                        nullptr
+                    );
+                });
+            }
+
+            void play_from_url(const std::string &url) {
+                if (url.empty()) {
+                    ESP_LOGE(TAG, "Cannot play audio: URL is empty");
+                    return;
+                }
+
+                ESP_LOGI(TAG, "Starting audio download from backend");
+
+                download_url = url;
+
+                xTaskCreate(
+                    download_task,
+                    "audio_download",
+                    8192,
+                    this,
+                    5,
+                    nullptr
+                );
+            }
 
         private:
         static constexpr const char *TAG = "oathbound_audio";
@@ -142,6 +161,55 @@ namespace oathbound_audio {
             }
 
             return ESP_OK;
+        }
+
+        static void startup_url_task(void *parameter) {
+            auto *self = static_cast<OathboundAudio *>(parameter);
+            self->fetch_startup_audio_url();
+            vTaskDelete(nullptr);
+        }
+
+        void fetch_startup_audio_url() {
+            DownloadContext context;
+            context.capture_body = true;
+
+            esp_http_client_config_t config = {};
+            config.url = "http://192.168.1.20:8080/api/audio/recording-url";
+            config.event_handler = http_event_handler;
+            config.user_data = &context;
+            config.timeout_ms = 15000;
+
+            esp_http_client_handle_t client = esp_http_client_init(&config);
+
+            if (client == nullptr) {
+                ESP_LOGE(TAG, "Failed to initialize startup URL HTTP client");
+                return;
+            }
+
+            esp_err_t err = esp_http_client_perform(client);
+
+            if (err == ESP_OK) {
+                int status = esp_http_client_get_status_code(client);
+
+                if (status == 200 && !context.body.empty()) {
+                    ESP_LOGI(TAG, "Startup audio URL received");
+
+                    // Remove trailing whitespace/newlines
+                    while (!context.body.empty() &&
+                        isspace(static_cast<unsigned char>(context.body.back()))) {
+                        context.body.pop_back();
+                    }
+
+                    play_from_url(context.body);
+                } else {
+                    ESP_LOGE(TAG, "Startup URL request failed. HTTP status: %d", status);
+                }
+            } else {
+                ESP_LOGE(TAG, "Startup URL HTTP request error: %s",
+                        esp_err_to_name(err));
+            }
+
+            esp_http_client_cleanup(client);
         }
 
         uint16_t read_u16(const uint8_t *data) {
@@ -474,37 +542,13 @@ namespace oathbound_audio {
         }
 
         void perform_download() {
-            ESP_LOGI(TAG, "Requesting audio URL from Spring Boot...");
+            ESP_LOGI(TAG, "Downloading audio from supplied URL...");
 
-            DownloadContext url_context;
-            url_context.capture_body = true;
+            std::string url = download_url;
 
-            esp_http_client_config_t backend_config = {};
-            backend_config.url =
-                "http://192.168.1.20:8080/api/audio/recording-url";
-            backend_config.event_handler = http_event_handler;
-            backend_config.user_data = &url_context;
-            backend_config.timeout_ms = 15000;
-
-            esp_http_client_handle_t backend =
-                esp_http_client_init(&backend_config);
-
-            esp_err_t result = esp_http_client_perform(backend);
-            int status = esp_http_client_get_status_code(backend);
-
-            esp_http_client_cleanup(backend);
-
-            if (result != ESP_OK || status != 200) {
-            ESP_LOGE(TAG, "Backend request failed. Status: %d", status);
-            return;
-            }
-
-            std::string url = url_context.body;
-
-            while (!url.empty() &&
-                (url.back() == '\n' || url.back() == '\r' ||
-                    url.back() == ' ')) {
-            url.pop_back();
+            if (url.empty()) {
+                ESP_LOGE(TAG, "No download URL supplied");
+                return;
             }
 
             ESP_LOGI(TAG, "Received presigned URL. Starting S3 download...");
@@ -536,14 +580,15 @@ namespace oathbound_audio {
             esp_http_client_handle_t audio =
                 esp_http_client_init(&audio_config);
 
-            result = esp_http_client_perform(audio);
-            status = esp_http_client_get_status_code(audio);
+            esp_err_t result = esp_http_client_perform(audio);
+            int status = esp_http_client_get_status_code(audio);
 
             esp_http_client_cleanup(audio);
 
             if (result != ESP_OK || status != 200) {
-            ESP_LOGE(TAG, "S3 download failed. Status: %d", status);
-            return;
+                ESP_LOGE(TAG, "S3 download failed. Status: %d", status);
+                heap_caps_free(audio_context.buffer);
+                return;
             }
             if (audio_context.overflow) {
                 ESP_LOGE(TAG, "Audio buffer overflow!");
@@ -585,6 +630,7 @@ namespace oathbound_audio {
                 ESP_LOGI(TAG, "Channels: %u", channels);
                 ESP_LOGI(TAG, "Sample rate: %lu", (unsigned long) sample_rate);
                 ESP_LOGI(TAG, "Bits per sample: %u", bits_per_sample);
+
                 if (!play_wav(audio_context.buffer, audio_context.bytes_received)) {
                     ESP_LOGE(TAG, "Audio playback failed");
                 } else {
@@ -605,5 +651,6 @@ namespace oathbound_audio {
 
             heap_caps_free(audio_context.buffer);
         }
+        std::string download_url;
     };
 } 

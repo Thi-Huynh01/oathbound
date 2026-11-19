@@ -10,6 +10,7 @@
 #include <string>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <functional>
 
 #include "driver/i2s_std.h"
 #include "esp_log.h"
@@ -298,7 +299,7 @@ namespace oathbound_recording {
         return true;
     }
 
-    inline bool upload_recording() {
+    inline bool upload_recording(std::string &audio_url) {
         if (buffer == nullptr || wav_size == 0) {
             ESP_LOGE("OATHBOUND_RECORDING", "No WAV recording available");
             return false;
@@ -313,7 +314,7 @@ namespace oathbound_recording {
         esp_http_client_config_t config = {};
         config.url = URL;
         config.method = HTTP_METHOD_POST;
-        config.timeout_ms = 30000;
+        config.timeout_ms = 120000;
 
         esp_http_client_handle_t client =
             esp_http_client_init(&config);
@@ -403,19 +404,112 @@ namespace oathbound_recording {
             status_code
         );
 
+        bool response_success = false;
+
+        if (status_code >= 200 && status_code < 300) {
+
+            std::string response_body;
+            char response_buffer[512];
+
+            int bytes_read;
+
+            while ((bytes_read = esp_http_client_read(
+                client,
+                response_buffer,
+                sizeof(response_buffer)
+            )) > 0) {
+                response_body.append(response_buffer, bytes_read);
+            }
+
+            if (bytes_read < 0) {
+                ESP_LOGE(
+                    "OATHBOUND_RECORDING",
+                    "Failed to read Spring Boot response"
+                );
+            } else {
+                ESP_LOGI(
+                    "OATHBOUND_RECORDING",
+                    "Received response: %s",
+                    response_body.c_str()
+                );
+
+                size_t key_position = response_body.find("\"audio_url\"");
+
+                if (key_position != std::string::npos) {
+
+                    size_t colon_position = response_body.find(':', key_position);
+
+                    size_t value_start = response_body.find('"', colon_position + 1);
+
+                    size_t value_end = response_body.find('"', value_start + 1);
+
+                    if (value_start != std::string::npos &&
+                        value_end != std::string::npos) {
+
+                        audio_url = response_body.substr(
+                            value_start + 1,
+                            value_end - value_start - 1
+                        );
+
+                        ESP_LOGI(
+                            "OATHBOUND_RECORDING",
+                            "Received audio URL successfully"
+                        );
+
+                        response_success = true;
+
+                    } else {
+                        ESP_LOGE(
+                            "OATHBOUND_RECORDING",
+                            "Could not extract audio URL"
+                        );
+                    }
+
+                } else {
+                    ESP_LOGE(
+                        "OATHBOUND_RECORDING",
+                        "audio_url not found in response"
+                    );
+                }
+            }
+        }
+
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
 
-        return status_code >= 200 && status_code < 300;
+        return response_success;
     }
 
-    inline void upload_task(void* parameter) {
+    using AudioPlaybackCallback = void (*)(const std::string &);
+    inline AudioPlaybackCallback audio_playback_callback = nullptr;
+
+    inline void set_audio_playback_callback(AudioPlaybackCallback callback) {
+        audio_playback_callback = callback;
+    }
+
+    inline void upload_task(void *parameter) {
         ESP_LOGI("OATHBOUND_RECORDING", "Background upload started");
 
-        bool uploaded = upload_recording();
+        std::string audio_url;
+        bool uploaded = upload_recording(audio_url);
 
         if (uploaded) {
             ESP_LOGI("OATHBOUND_RECORDING", "Recording uploaded successfully!");
+
+            if (!audio_url.empty() && audio_playback_callback != nullptr) {
+                ESP_LOGI(
+                    "OATHBOUND_RECORDING",
+                    "Sending AI response URL to audio player..."
+                );
+
+                audio_playback_callback(audio_url);
+            } else {
+                ESP_LOGE(
+                    "OATHBOUND_RECORDING",
+                    "Audio URL or playback callback is missing"
+                );
+            }
+
         } else {
             ESP_LOGE("OATHBOUND_RECORDING", "Recording upload failed!");
         }

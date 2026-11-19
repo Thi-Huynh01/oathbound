@@ -104,4 +104,22 @@ public class SonioxService {
                 .body(String.class);
     }
 
+    public String extractTranscript(String transcriptionResponse) throws Exception {
+
+        JsonNode root = objectMapper.readTree(transcriptionResponse);
+
+        StringBuilder transcript = new StringBuilder();
+
+        JsonNode tokens = root.get("tokens");
+
+        if (tokens != null && tokens.isArray()) {
+            for (JsonNode token : tokens) {
+                String text = token.get("text").asString();
+                transcript.append(text);
+            }
+        }
+
+        return transcript.toString().trim();
+    }
+
 }
